@@ -2627,6 +2627,102 @@ def test_to_absolute_from_storage_keeps_a_foreign_key_in_its_own_syntax(tmp_path
     )
 
 
+@pytest.mark.parametrize(
+    "raw_key, expected",
+    [
+        # Plain POSIX, dot segment.
+        ("/home/u/./foo.py", "/home/u/foo.py"),
+        # Double-leading-slash POSIX: on Windows, Path(key).is_absolute()
+        # parses this as a UNC root and misroutes it through ntpath (the
+        # bug). posixpath keeps exactly two leading slashes (POSIX leaves
+        # that form implementation-defined) so it must survive unchanged.
+        ("//home/u/foo.py", "//home/u/foo.py"),
+        ("//server/share/sub/../foo.py", "//server/share/foo.py"),
+        # 3+ leading slashes: posixpath collapses these to a single slash.
+        ("///a/b", "/a/b"),
+        # Windows UNC written natively (backslashes) -- already
+        # drive/backslash-syntax detected, so this direction never
+        # depended on the current platform.
+        ("\\\\server\\share\\sub\\..\\foo.py", "\\\\server\\share\\foo.py"),
+        # Windows drive letter, forward slashes: still drive-syntax, and
+        # ntpath.normpath normalizes the separators to backslashes.
+        ("C:/x/../y.py", "C:\\y.py"),
+        # Windows drive letter, native backslashes.
+        ("C:\\x\\..\\y.py", "C:\\y.py"),
+    ],
+)
+def test_to_absolute_from_storage_own_syntax_matrix(raw_key, expected, tmp_path):
+    """Parametrized neighbour of the test above, covering the full flavor
+    matrix from the #1964-followup review: every case must canonicalize
+    under the KEY's own path syntax, never the syntax of whichever machine
+    happens to be running the code."""
+    from graphify.detect import _to_absolute_from_storage
+
+    assert _to_absolute_from_storage(raw_key, tmp_path) == expected
+
+
+@pytest.mark.parametrize(
+    "posix_key, expected",
+    [
+        ("//home/u/foo.py", "//home/u/foo.py"),
+        ("//server/share/sub/../foo.py", "//server/share/foo.py"),
+        ("///a/b", "/a/b"),
+    ],
+)
+def test_normpath_own_flavor_posix_double_slash_keys_survive_simulated_windows_host(
+    monkeypatch, posix_key, expected
+):
+    """The bug this guards against only reproduces when the CODE is running
+    on Windows: ``Path(key).is_absolute()`` (used by the old implementation
+    to pick a flavor) applies the CURRENT platform's rules, and only on
+    Windows does a bare ``//`` prefix parse as UNC-absolute. On a POSIX
+    host the old code was accidentally correct, since ``os.path`` there
+    already IS ``posixpath`` -- so a plain, unpatched test would pass on
+    the old code when run in POSIX CI and hide the regression.
+
+    Simulate "running on Windows" deterministically -- regardless of the
+    actual host -- by swapping in ``PureWindowsPath`` and ``ntpath`` for
+    the duration of the call. This fails against the pre-fix
+    ``_normpath_own_flavor`` (which still consults ``Path(key).is_absolute()``
+    and ``os.path.normpath``) on ANY host, and passes against the fix
+    (which decides the flavor from the key's syntax alone and never
+    touches ``Path`` or ``os.path``)."""
+    import ntpath
+    import pathlib
+
+    monkeypatch.setattr(detect_mod, "Path", pathlib.PureWindowsPath)
+    monkeypatch.setattr(detect_mod.os, "path", ntpath)
+
+    assert detect_mod._normpath_own_flavor(posix_key) == expected
+
+
+@pytest.mark.parametrize(
+    "key, expected",
+    [
+        ("\\\\server\\share\\sub\\..\\foo.py", "\\\\server\\share\\foo.py"),
+        ("C:/x/../y.py", "C:\\y.py"),
+        ("C:\\x\\..\\y.py", "C:\\y.py"),
+    ],
+)
+def test_normpath_own_flavor_windows_keys_survive_simulated_posix_host(
+    monkeypatch, key, expected
+):
+    """Mirror of the test above: a Windows-flavored key (drive letter or
+    leading backslash) must still normalize under ntpath even when the
+    code believes it's running on POSIX -- these cases were already
+    syntax-detected (drive-letter regex / backslash prefix) rather than
+    routed through ``Path(key).is_absolute()``, so this direction never
+    depended on the host platform, but it's pinned here so a future
+    refactor can't reintroduce that dependency."""
+    import posixpath
+    import pathlib
+
+    monkeypatch.setattr(detect_mod, "Path", pathlib.PurePosixPath)
+    monkeypatch.setattr(detect_mod.os, "path", posixpath)
+
+    assert detect_mod._normpath_own_flavor(key) == expected
+
+
 def test_save_manifest_relativize_step_collapses_seeded_duplicates(tmp_path, monkeypatch):
     """#1964: the same collapse must happen on the WRITE side too. If the
     seeded rows hold two keys for a file untouched by this save (#917) that

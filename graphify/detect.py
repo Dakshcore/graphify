@@ -2152,6 +2152,23 @@ def _to_relative_for_storage(key: str, root: Path) -> str:
 _DRIVE_LETTER_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
+def _is_windows_flavored_key(key: str) -> bool:
+    """True if ``key``'s own syntax — not the running platform's rules —
+    marks it as Windows-style: a drive letter (``C:\\`` or ``C:/``) or a
+    leading backslash (UNC ``\\\\server\\share`` or rooted ``\\foo``).
+
+    Keys are written via ``str(Path(...))`` over an ``os.walk`` corpus (see
+    ``detect()``), so a key produced natively on Windows is always one of
+    these two forms — Windows never emits a forward-slash-only UNC key such
+    as ``//server/share``. That makes this syntactic check exact for keys
+    this codebase writes; a key matching neither is POSIX-flavored, even
+    one starting with ``//`` (see :func:`_normpath_own_flavor`). Shared by
+    :func:`_looks_absolute` and :func:`_normpath_own_flavor` so both agree
+    on what counts as Windows syntax (#1964 review: duplication).
+    """
+    return key.startswith("\\") or bool(_DRIVE_LETTER_RE.match(key))
+
+
 def _looks_absolute(key: str) -> bool:
     """True if ``key`` is absolute under ANY platform's path syntax, not
     just the current one.
@@ -2167,8 +2184,8 @@ def _looks_absolute(key: str) -> bool:
     """
     return (
         Path(key).is_absolute()
-        or key.startswith(("/", "\\"))
-        or bool(_DRIVE_LETTER_RE.match(key))
+        or key.startswith("/")
+        or _is_windows_flavored_key(key)
     )
 
 
@@ -2176,17 +2193,29 @@ def _normpath_own_flavor(key: str) -> str:
     """``normpath`` an absolute ``key`` under its OWN platform's syntax.
 
     ``os.path.normpath`` applies the current platform's rules, so on Windows
-    it rewrites a POSIX key ``/home/u/foo.py`` to ``\\home\\u\\foo.py`` —
-    a string POSIX can no longer read back, since ``posixpath`` does not
-    treat ``\\`` as a separator. Pick the flavor from the key itself: a
-    drive letter or leading backslash is Windows, a leading ``/`` that the
-    current platform does not consider absolute is POSIX.
+    it rewrites a POSIX key ``/home/u/foo.py`` to ``\\home\\u\\foo.py`` — a
+    string POSIX can no longer read back, since ``posixpath`` does not treat
+    ``\\`` as a separator. The flavor must therefore come from the key's own
+    syntax, never from ``Path(key).is_absolute()``: that method applies the
+    CURRENT platform's rules too, and on Windows a POSIX key with a leading
+    ``//`` parses as a UNC-absolute path, sending it through ``ntpath`` by
+    mistake (the ``//home/u/foo.py`` bug this function exists to avoid).
+
+    So: a drive letter or leading backslash is Windows
+    (:func:`_is_windows_flavored_key`); anything else starting with ``/``
+    — including a bare ``//`` or ``///`` prefix — is POSIX, matching
+    ``posixpath.normpath``'s own rule of collapsing 3+ leading slashes to
+    one while preserving exactly two (POSIX leaves a double leading slash
+    implementation-defined).
     """
-    if Path(key).is_absolute():
-        return os.path.normpath(key)
-    if key.startswith("\\") or _DRIVE_LETTER_RE.match(key):
+    if _is_windows_flavored_key(key):
         return ntpath.normpath(key)
-    return posixpath.normpath(key)
+    if key.startswith("/"):
+        return posixpath.normpath(key)
+    # _looks_absolute only sends us keys matching one of the two syntaxes
+    # above, so this is unreachable in practice; fall back to the current
+    # platform's own rules rather than silently returning the key as-is.
+    return os.path.normpath(key)
 
 
 def _to_absolute_from_storage(key: str, root: Path) -> str:
